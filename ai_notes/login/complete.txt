@@ -1,0 +1,2484 @@
+# Complete AWS Cognito Flask Application Package
+
+This contains all files needed for the complete AWS Cognito Flask application with testing.
+
+## File Structure
+```
+aws-cognito-flask-app/
+├── app.py
+├── test_app.py
+├── conftest.py
+├── requirements.txt
+├── requirements-test.txt
+├── pytest.ini
+├── .coveragerc
+├── Makefile
+├── .gitignore
+├── README.md
+└── setup.py
+```
+
+---
+
+## app.py
+```python
+#!/usr/bin/env python3
+"""
+AWS Cognito Flask Login Application
+
+A complete web application that demonstrates user authentication using AWS Cognito.
+Includes user registration, email verification, login, logout, and protected routes.
+
+Features:
+- User registration with email verification
+- Secure login/logout functionality
+- Protected routes with automatic token refresh
+- Session management with proper security
+- Password strength requirements
+- Resend verification codes
+- Comprehensive error handling
+
+Requirements:
+- pip install flask boto3 python-jose[cryptography]
+- AWS credentials configured (via AWS CLI, environment variables, or IAM roles)
+- AWS Cognito User Pool and App Client configured with email verification enabled
+"""
+
+import os
+import json
+import base64
+from datetime import datetime, timedelta
+from functools import wraps
+
+import boto3
+from flask import Flask, render_template_string, request, redirect, url_for, session, flash, jsonify
+from botocore.exceptions import ClientError
+import hmac
+import hashlib
+
+
+class CognitoAuth:
+    """AWS Cognito authentication handler"""
+
+    def __init__(self, user_pool_id, client_id, client_secret, region='us-east-1'):
+        self.user_pool_id = user_pool_id
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.region = region
+        self.client = boto3.client('cognito-idp', region_name=region)
+
+    def _calculate_secret_hash(self, username):
+        """Calculate the secret hash for Cognito authentication"""
+        message = username + self.client_id
+        key = self.client_secret.encode('utf-8')
+        return base64.b64encode(
+            hmac.new(key, message.encode('utf-8'), digestmod=hashlib.sha256).digest()
+        ).decode()
+
+    def authenticate_user(self, username, password):
+        """Authenticate user with AWS Cognito"""
+        try:
+            secret_hash = self._calculate_secret_hash(username)
+
+            response = self.client.admin_initiate_auth(
+                UserPoolId=self.user_pool_id,
+                ClientId=self.client_id,
+                AuthFlow='ADMIN_NO_SRP_AUTH',
+                AuthParameters={
+                    'USERNAME': username,
+                    'PASSWORD': password,
+                    'SECRET_HASH': secret_hash
+                }
+            )
+
+            return {
+                'success': True,
+                'tokens': response['AuthenticationResult'],
+                'username': username
+            }
+
+        except ClientError as e:
+            error_code = e.response['Error']['Code']
+            if error_code == 'NotAuthorizedException':
+                return {'success': False, 'error': 'Invalid username or password'}
+            elif error_code == 'UserNotConfirmedException':
+                return {'success': False, 'error': 'User account not confirmed'}
+            elif error_code == 'PasswordResetRequiredException':
+                return {'success': False, 'error': 'Password reset required'}
+            else:
+                return {'success': False, 'error': f'Authentication failed: {str(e)}'}
+
+    def get_user_info(self, access_token):
+        """Get user information from access token"""
+        try:
+            response = self.client.get_user(AccessToken=access_token)
+            user_attributes = {attr['Name']: attr['Value'] for attr in response['UserAttributes']}
+            return {
+                'success': True,
+                'username': response['Username'],
+                'attributes': user_attributes
+            }
+        except ClientError as e:
+            return {'success': False, 'error': str(e)}
+
+    def refresh_token(self, refresh_token, username):
+        """Refresh access token using refresh token"""
+        try:
+            secret_hash = self._calculate_secret_hash(username)
+
+            response = self.client.admin_initiate_auth(
+                UserPoolId=self.user_pool_id,
+                ClientId=self.client_id,
+                AuthFlow='REFRESH_TOKEN_AUTH',
+                AuthParameters={
+                    'REFRESH_TOKEN': refresh_token,
+                    'SECRET_HASH': secret_hash
+                }
+            )
+
+            return {
+                'success': True,
+                'tokens': response['AuthenticationResult']
+            }
+        except ClientError as e:
+            return {'success': False, 'error': str(e)}
+
+    def sign_up_user(self, username, password, email, first_name=None, last_name=None):
+        """Sign up a new user with AWS Cognito"""
+        try:
+            secret_hash = self._calculate_secret_hash(username)
+
+            user_attributes = [
+                {'Name': 'email', 'Value': email}
+            ]
+
+            if first_name:
+                user_attributes.append({'Name': 'given_name', 'Value': first_name})
+            if last_name:
+                user_attributes.append({'Name': 'family_name', 'Value': last_name})
+
+            response = self.client.sign_up(
+                ClientId=self.client_id,
+                Username=username,
+                Password=password,
+                SecretHash=secret_hash,
+                UserAttributes=user_attributes
+            )
+
+            return {
+                'success': True,
+                'user_sub': response['UserSub'],
+                'confirmation_required': not response['UserConfirmed']
+            }
+
+        except ClientError as e:
+            error_code = e.response['Error']['Code']
+            if error_code == 'UsernameExistsException':
+                return {'success': False, 'error': 'Username already exists'}
+            elif error_code == 'InvalidPasswordException':
+                return {'success': False, 'error': 'Password does not meet requirements'}
+            elif error_code == 'InvalidParameterException':
+                return {'success': False, 'error': 'Invalid email format or missing required fields'}
+            else:
+                return {'success': False, 'error': f'Registration failed: {str(e)}'}
+
+    def confirm_sign_up(self, username, confirmation_code):
+        """Confirm user sign-up with verification code"""
+        try:
+            secret_hash = self._calculate_secret_hash(username)
+
+            response = self.client.confirm_sign_up(
+                ClientId=self.client_id,
+                Username=username,
+                ConfirmationCode=confirmation_code,
+                SecretHash=secret_hash
+            )
+
+            return {'success': True}
+
+        except ClientError as e:
+            error_code = e.response['Error']['Code']
+            if error_code == 'CodeMismatchException':
+                return {'success': False, 'error': 'Invalid verification code'}
+            elif error_code == 'ExpiredCodeException':
+                return {'success': False, 'error': 'Verification code has expired'}
+            elif error_code == 'NotAuthorizedException':
+                return {'success': False, 'error': 'User is already confirmed or code is invalid'}
+            else:
+                return {'success': False, 'error': f'Confirmation failed: {str(e)}'}
+
+    def resend_confirmation_code(self, username):
+        """Resend confirmation code to user"""
+        try:
+            secret_hash = self._calculate_secret_hash(username)
+
+            response = self.client.resend_confirmation_code(
+                ClientId=self.client_id,
+                Username=username,
+                SecretHash=secret_hash
+            )
+
+            return {'success': True}
+
+        except ClientError as e:
+            return {'success': False, 'error': f'Failed to resend code: {str(e)}'}
+
+
+# Flask Application Configuration
+app = Flask(__name__)
+
+# Configuration - Replace with your actual values
+app.config.update({
+    'SECRET_KEY': os.environ.get('SECRET_KEY', 'your-secret-key-here'),
+    'COGNITO_USER_POOL_ID': os.environ.get('COGNITO_USER_POOL_ID', 'us-east-1_xxxxxxxxx'),
+    'COGNITO_CLIENT_ID': os.environ.get('COGNITO_CLIENT_ID', 'your-client-id'),
+    'COGNITO_CLIENT_SECRET': os.environ.get('COGNITO_CLIENT_SECRET', 'your-client-secret'),
+    'COGNITO_REGION': os.environ.get('COGNITO_REGION', 'us-east-1'),
+    'PERMANENT_SESSION_LIFETIME': timedelta(hours=1)
+})
+
+# Initialize Cognito Auth
+cognito_auth = CognitoAuth(
+    user_pool_id=app.config['COGNITO_USER_POOL_ID'],
+    client_id=app.config['COGNITO_CLIENT_ID'],
+    client_secret=app.config['COGNITO_CLIENT_SECRET'],
+    region=app.config['COGNITO_REGION']
+)
+
+
+def login_required(f):
+    """Decorator to require login for protected routes"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user' not in session:
+            flash('Please log in to access this page.', 'warning')
+            return redirect(url_for('login'))
+
+        # Check if access token is expired and refresh if needed
+        if 'token_expires' in session and datetime.now() > session['token_expires']:
+            if 'refresh_token' in session:
+                result = cognito_auth.refresh_token(
+                    session['refresh_token'],
+                    session['user']['username']
+                )
+                if result['success']:
+                    tokens = result['tokens']
+                    session['access_token'] = tokens['AccessToken']
+                    session['token_expires'] = datetime.now() + timedelta(seconds=tokens['ExpiresIn'])
+                    if 'RefreshToken' in tokens:
+                        session['refresh_token'] = tokens['RefreshToken']
+                else:
+                    session.clear()
+                    flash('Session expired. Please log in again.', 'warning')
+                    return redirect(url_for('login'))
+            else:
+                session.clear()
+                flash('Session expired. Please log in again.', 'warning')
+                return redirect(url_for('login'))
+
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+# HTML Templates
+LOGIN_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AWS Cognito Login</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 400px;
+            margin: 50px auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .login-container {
+            background: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        input[type="text"], input[type="password"] {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+        button {
+            width: 100%;
+            padding: 10px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            font-size: 16px;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        .alert {
+            padding: 10px;
+            margin-bottom: 15px;
+            border-radius: 4px;
+        }
+        .alert-danger {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        .alert-success {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .alert-warning {
+            background-color: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeaa7;
+        }
+        h1 {
+            text-align: center;
+            color: #333;
+            margin-bottom: 30px;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-container">
+        <h1>AWS Cognito Login</h1>
+
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="alert alert-{{ 'danger' if category == 'error' else category }}">
+                        {{ message }}
+                    </div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+
+        <form method="POST">
+            <div class="form-group">
+                <label for="username">Username:</label>
+                <input type="text" id="username" name="username" required>
+            </div>
+
+            <div class="form-group">
+                <label for="password">Password:</label>
+                <input type="password" id="password" name="password" required>
+            </div>
+
+            <button type="submit">Login</button>
+        </form>
+
+        <div style="text-align: center; margin-top: 20px; padding-top: 20px; border-top: 1px solid #eee;">
+            <p>Don't have an account? <a href="{{ url_for('register') }}" style="color: #007bff;">Sign up here</a></p>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+REGISTER_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sign Up - AWS Cognito</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 450px;
+            margin: 50px auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .register-container {
+            background: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        input[type="text"], input[type="email"], input[type="password"] {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+        button {
+            width: 100%;
+            padding: 10px;
+            background-color: #28a745;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            font-size: 16px;
+            cursor: pointer;
+            margin-bottom: 10px;
+        }
+        button:hover {
+            background-color: #218838;
+        }
+        .alert {
+            padding: 10px;
+            margin-bottom: 15px;
+            border-radius: 4px;
+        }
+        .alert-danger {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        .alert-success {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .alert-warning {
+            background-color: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeaa7;
+        }
+        h1 {
+            text-align: center;
+            color: #333;
+            margin-bottom: 30px;
+        }
+        .password-requirements {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 4px;
+            margin-bottom: 15px;
+            font-size: 14px;
+        }
+        .password-requirements h4 {
+            margin-top: 0;
+            color: #495057;
+        }
+        .password-requirements ul {
+            margin: 10px 0;
+            padding-left: 20px;
+        }
+        .login-link {
+            text-align: center;
+            margin-top: 20px;
+            padding-top: 20px;
+            border-top: 1px solid #eee;
+        }
+    </style>
+</head>
+<body>
+    <div class="register-container">
+        <h1>Create Account</h1>
+
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="alert alert-{{ 'danger' if category == 'error' else category }}">
+                        {{ message }}
+                    </div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+
+        <div class="password-requirements">
+            <h4>Password Requirements:</h4>
+            <ul>
+                <li>At least 8 characters long</li>
+                <li>Contains uppercase and lowercase letters</li>
+                <li>Contains at least one number</li>
+                <li>Contains at least one special character</li>
+            </ul>
+        </div>
+
+        <form method="POST">
+            <div class="form-group">
+                <label for="username">Username:</label>
+                <input type="text" id="username" name="username" required
+                       value="{{ request.form.username if request.form.username else '' }}">
+            </div>
+
+            <div class="form-group">
+                <label for="email">Email:</label>
+                <input type="email" id="email" name="email" required
+                       value="{{ request.form.email if request.form.email else '' }}">
+            </div>
+
+            <div class="form-group">
+                <label for="first_name">First Name (Optional):</label>
+                <input type="text" id="first_name" name="first_name"
+                       value="{{ request.form.first_name if request.form.first_name else '' }}">
+            </div>
+
+            <div class="form-group">
+                <label for="last_name">Last Name (Optional):</label>
+                <input type="text" id="last_name" name="last_name"
+                       value="{{ request.form.last_name if request.form.last_name else '' }}">
+            </div>
+
+            <div class="form-group">
+                <label for="password">Password:</label>
+                <input type="password" id="password" name="password" required>
+            </div>
+
+            <div class="form-group">
+                <label for="confirm_password">Confirm Password:</label>
+                <input type="password" id="confirm_password" name="confirm_password" required>
+            </div>
+
+            <button type="submit">Create Account</button>
+        </form>
+
+        <div class="login-link">
+            <p>Already have an account? <a href="{{ url_for('login') }}" style="color: #007bff;">Login here</a></p>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+CONFIRM_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Confirm Account - AWS Cognito</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 450px;
+            margin: 50px auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .confirm-container {
+            background: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        input[type="text"] {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+        button {
+            width: 100%;
+            padding: 10px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            font-size: 16px;
+            cursor: pointer;
+            margin-bottom: 10px;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        .resend-btn {
+            background-color: #6c757d;
+            font-size: 14px;
+            padding: 8px;
+        }
+        .resend-btn:hover {
+            background-color: #545b62;
+        }
+        .alert {
+            padding: 10px;
+            margin-bottom: 15px;
+            border-radius: 4px;
+        }
+        .alert-danger {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        .alert-success {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .alert-info {
+            background-color: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+        }
+        h1 {
+            text-align: center;
+            color: #333;
+            margin-bottom: 30px;
+        }
+        .instructions {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 4px;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div class="confirm-container">
+        <h1>Confirm Your Account</h1>
+
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="alert alert-{{ 'danger' if category == 'error' else category }}">
+                        {{ message }}
+                    </div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+
+        <div class="instructions">
+            <p><strong>Check your email!</strong></p>
+            <p>We've sent a verification code to your email address. Enter the code below to complete your registration.</p>
+            <p><strong>Username:</strong> {{ username }}</p>
+        </div>
+
+        <form method="POST">
+            <input type="hidden" name="username" value="{{ username }}">
+
+            <div class="form-group">
+                <label for="confirmation_code">Verification Code:</label>
+                <input type="text" id="confirmation_code" name="confirmation_code"
+                       required placeholder="Enter 6-digit code" maxlength="6">
+            </div>
+
+            <button type="submit">Confirm Account</button>
+        </form>
+
+        <form method="POST" action="{{ url_for('resend_confirmation') }}">
+            <input type="hidden" name="username" value="{{ username }}">
+            <button type="submit" class="resend-btn">Resend Verification Code</button>
+        </form>
+
+        <div style="text-align: center; margin-top: 20px; padding-top: 20px; border-top: 1px solid #eee;">
+            <p><a href="{{ url_for('login') }}" style="color: #007bff;">Back to Login</a></p>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+DASHBOARD_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard - AWS Cognito App</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 20px auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .dashboard-container {
+            background: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 30px;
+            padding-bottom: 20px;
+            border-bottom: 1px solid #eee;
+        }
+        .user-info {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+        }
+        .user-info h3 {
+            margin-top: 0;
+            color: #333;
+        }
+        .user-detail {
+            margin: 10px 0;
+        }
+        .user-detail strong {
+            display: inline-block;
+            width: 120px;
+        }
+        .logout-btn {
+            background-color: #dc3545;
+            color: white;
+            padding: 8px 16px;
+            text-decoration: none;
+            border-radius: 4px;
+            border: none;
+            cursor: pointer;
+        }
+        .logout-btn:hover {
+            background-color: #c82333;
+        }
+        .alert {
+            padding: 10px;
+            margin-bottom: 15px;
+            border-radius: 4px;
+        }
+        .alert-success {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        h1 {
+            color: #333;
+            margin: 0;
+        }
+        .status {
+            color: #28a745;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <div class="dashboard-container">
+        <div class="header">
+            <h1>Dashboard</h1>
+            <a href="{{ url_for('logout') }}" class="logout-btn">Logout</a>
+        </div>
+
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="alert alert-{{ category }}">
+                        {{ message }}
+                    </div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+
+        <div class="user-info">
+            <h3>Welcome, {{ user.username }}!</h3>
+            <div class="user-detail">
+                <strong>Status:</strong> <span class="status">Successfully authenticated via AWS Cognito</span>
+            </div>
+            <div class="user-detail">
+                <strong>Username:</strong> {{ user.username }}
+            </div>
+            {% if user.attributes %}
+                {% for key, value in user.attributes.items() %}
+                    <div class="user-detail">
+                        <strong>{{ key.replace('_', ' ').title() }}:</strong> {{ value }}
+                    </div>
+                {% endfor %}
+            {% endif %}
+            <div class="user-detail">
+                <strong>Session Started:</strong> {{ session_start }}
+            </div>
+        </div>
+
+        <p>This is a protected area that requires AWS Cognito authentication.
+        You can now access any protected routes in the application.</p>
+
+        <h3>Available Actions:</h3>
+        <ul>
+            <li><a href="{{ url_for('profile') }}">View Profile</a></li>
+            <li><a href="{{ url_for('protected_api') }}">Protected API Endpoint</a></li>
+            <li><a href="{{ url_for('logout') }}">Logout</a></li>
+        </ul>
+
+        <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #eee; font-size: 14px; color: #666;">
+            <p><strong>Note:</strong> This application demonstrates AWS Cognito integration with user registration,
+            email verification, secure login, and session management.</p>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+
+# Routes
+@app.route('/')
+def index():
+    """Home page - redirect to dashboard if logged in, otherwise to login"""
+    if 'user' in session:
+        return redirect(url_for('dashboard'))
+    return redirect(url_for('login'))
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    """Login page and authentication handler"""
+    if 'user' in session:
+        return redirect(url_for('dashboard'))
+
+    if request.method == 'POST':
+        username = request.form['username'].strip()
+        password = request.form['password']
+
+        if not username or not password:
+            flash('Please enter both username and password.', 'error')
+            return render_template_string(LOGIN_TEMPLATE)
+
+        # Authenticate with AWS Cognito
+        result = cognito_auth.authenticate_user(username, password)
+
+        if result['success']:
+            tokens = result['tokens']
+
+            # Get user information
+            user_info = cognito_auth.get_user_info(tokens['AccessToken'])
+
+            if user_info['success']:
+                # Store user session
+                session.permanent = True
+                session['user'] = {
+                    'username': user_info['username'],
+                    'attributes': user_info['attributes']
+                }
+                session['access_token'] = tokens['AccessToken']
+                session['refresh_token'] = tokens.get('RefreshToken')
+                session['token_expires'] = datetime.now() + timedelta(seconds=tokens['ExpiresIn'])
+                session['login_time'] = datetime.now().isoformat()
+
+                flash('Login successful!', 'success')
+                return redirect(url_for('dashboard'))
+            else:
+                flash('Failed to retrieve user information.', 'error')
+        else:
+            flash(result['error'], 'error')
+
+    return render_template_string(LOGIN_TEMPLATE)
+
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    """User registration page and handler"""
+    if 'user' in session:
+        return redirect(url_for('dashboard'))
+
+    if request.method == 'POST':
+        username = request.form['username'].strip()
+        email = request.form['email'].strip()
+        password = request.form['password']
+        confirm_password = request.form['confirm_password']
+        first_name = request.form.get('first_name', '').strip()
+        last_name = request.form.get('last_name', '').strip()
+
+        # Validation
+        if not username or not email or not password:
+            flash('Please fill in all required fields.', 'error')
+            return render_template_string(REGISTER_TEMPLATE)
+
+        if password != confirm_password:
+            flash('Passwords do not match.', 'error')
+            return render_template_string(REGISTER_TEMPLATE)
+
+        if len(password) < 8:
+            flash('Password must be at least 8 characters long.', 'error')
+            return render_template_string(REGISTER_TEMPLATE)
+
+        # Register user with AWS Cognito
+        result = cognito_auth.sign_up_user(
+            username=username,
+            password=password,
+            email=email,
+            first_name=first_name if first_name else None,
+            last_name=last_name if last_name else None
+        )
+
+        if result['success']:
+            if result['confirmation_required']:
+                flash('Registration successful! Please check your email for a verification code.', 'success')
+                return redirect(url_for('confirm_account', username=username))
+            else:
+                flash('Registration successful! You can now log in.', 'success')
+                return redirect(url_for('login'))
+        else:
+            flash(result['error'], 'error')
+
+    return render_template_string(REGISTER_TEMPLATE)
+
+
+@app.route('/confirm/<username>', methods=['GET', 'POST'])
+def confirm_account(username):
+    """Account confirmation page and handler"""
+    if 'user' in session:
+        return redirect(url_for('dashboard'))
+
+    if request.method == 'POST':
+        confirmation_code = request.form['confirmation_code'].strip()
+        username = request.form['username']
+
+        if not confirmation_code:
+            flash('Please enter the verification code.', 'error')
+            return render_template_string(CONFIRM_TEMPLATE, username=username)
+
+        # Confirm user registration
+        result = cognito_auth.confirm_sign_up(username, confirmation_code)
+
+        if result['success']:
+            flash('Account confirmed successfully! You can now log in.', 'success')
+            return redirect(url_for('login'))
+        else:
+            flash(result['error'], 'error')
+
+    return render_template_string(CONFIRM_TEMPLATE, username=username)
+
+
+@app.route('/resend-confirmation', methods=['POST'])
+def resend_confirmation():
+    """Resend confirmation code"""
+    username = request.form['username']
+
+    result = cognito_auth.resend_confirmation_code(username)
+
+    if result['success']:
+        flash('Verification code sent! Please check your email.', 'info')
+    else:
+        flash(result['error'], 'error')
+
+    return redirect(url_for('confirm_account', username=username))
+
+
+@app.route('/dashboard')
+@login_required
+def dashboard():
+    """Protected dashboard page"""
+    session_start = datetime.fromisoformat(session['login_time']).strftime('%Y-%m-%d %H:%M:%S')
+    return render_template_string(
+        DASHBOARD_TEMPLATE,
+        user=session['user'],
+        session_start=session_start
+    )
+
+
+@app.route('/profile')
+@login_required
+def profile():
+    """Protected profile page"""
+    user_info = cognito_auth.get_user_info(session['access_token'])
+
+    if user_info['success']:
+        # Update session with latest user info
+        session['user']['attributes'] = user_info['attributes']
+        return jsonify({
+            'username': user_info['username'],
+            'attributes': user_info['attributes'],
+            'session_info': {
+                'login_time': session['login_time'],
+                'token_expires': session['token_expires'].isoformat()
+            }
+        })
+    else:
+        return jsonify({'error': 'Failed to retrieve user information'}), 500
+
+
+@app.route('/api/protected')
+@login_required
+def protected_api():
+    """Protected API endpoint example"""
+    return jsonify({
+        'message': 'This is a protected API endpoint',
+        'user': session['user']['username'],
+        'timestamp': datetime.now().isoformat(),
+        'authenticated_via': 'AWS Cognito'
+    })
+
+
+@app.route('/logout')
+def logout():
+    """Logout and clear session"""
+    session.clear()
+    flash('You have been logged out successfully.', 'success')
+    return redirect(url_for('login'))
+
+
+@app.errorhandler(404)
+def not_found(error):
+    """404 error handler"""
+    return jsonify({'error': 'Not found'}), 404
+
+
+@app.errorhandler(500)
+def internal_error(error):
+    """500 error handler"""
+    return jsonify({'error': 'Internal server error'}), 500
+
+
+if __name__ == '__main__':
+    # Configuration check
+    required_config = [
+        'COGNITO_USER_POOL_ID',
+        'COGNITO_CLIENT_ID',
+        'COGNITO_CLIENT_SECRET'
+    ]
+
+    missing_config = [key for key in required_config if not app.config.get(key) or app.config[key].startswith('your-')]
+
+    if missing_config:
+        print("ERROR: Missing required configuration:")
+        for key in missing_config:
+            print(f"  - {key}")
+        print("\nPlease set these environment variables or update the configuration in the code.")
+        print("\nExample:")
+        print("export COGNITO_USER_POOL_ID='us-east-1_xxxxxxxxx'")
+        print("export COGNITO_CLIENT_ID='your-app-client-id'")
+        print("export COGNITO_CLIENT_SECRET='your-app-client-secret'")
+        exit(1)
+
+    print("Starting AWS Cognito Flask Application...")
+    print(f"User Pool ID: {app.config['COGNITO_USER_POOL_ID']}")
+    print(f"Client ID: {app.config['COGNITO_CLIENT_ID']}")
+    print(f"Region: {app.config['COGNITO_REGION']}")
+    print("\nFeatures:")
+    print("- User Registration with Email Verification")
+    print("- Secure Login/Logout")
+    print("- Protected Routes with Token Refresh")
+    print("- Session Management")
+    print("\nApplication will be available at: http://localhost:5000")
+
+    app.run(debug=True, host='0.0.0.0', port=5000)
+```
+
+---
+
+## test_app.py
+```python
+#!/usr/bin/env python3
+"""
+Clean Test Suite for AWS Cognito Flask Login Application
+
+This test suite imports from the main application and provides comprehensive testing
+for all authentication features without duplicating application code.
+
+Requirements:
+pip install pytest pytest-mock pytest-flask pytest-cov moto[cognitoidp]
+
+Run tests:
+pytest test_app.py -v
+pytest test_app.py::TestCognitoAuth -v  # Specific test class
+pytest test_app.py -k "login" -v        # Tests matching pattern
+pytest test_app.py --cov=app --cov-report=html  # With coverage
+"""
+
+import pytest
+import json
+from datetime import datetime, timedelta
+from unittest.mock import Mock, patch, MagicMock
+
+import boto3
+from moto import mock_cognitoidp
+from botocore.exceptions import ClientError
+
+# Import from the main application
+from app import app, cognito_auth, CognitoAuth
+
+
+class TestCognitoAuth:
+    """Unit tests for CognitoAuth class"""
+
+    @pytest.fixture
+    def cognito_auth_instance(self):
+        """Create CognitoAuth instance for testing"""
+        return CognitoAuth(
+            user_pool_id='us-east-1_test123456',
+            client_id='test-client-id',
+            client_secret='test-client-secret',
+            region='us-east-1'
+        )
+
+    def test_calculate_secret_hash(self, cognito_auth_instance):
+        """Test secret hash calculation"""
+        username = "testuser"
+        secret_hash = cognito_auth_instance._calculate_secret_hash(username)
+
+        # Verify it's a base64 encoded string
+        assert isinstance(secret_hash, str)
+        assert len(secret_hash) > 0
+
+        # Should be consistent
+        assert secret_hash == cognito_auth_instance._calculate_secret_hash(username)
+
+    @patch('boto3.client')
+    def test_authenticate_user_success(self, mock_boto_client, cognito_auth_instance):
+        """Test successful user authentication"""
+        # Mock successful response
+        mock_client = Mock()
+        mock_boto_client.return_value = mock_client
+        cognito_auth_instance.client = mock_client
+
+        mock_client.admin_initiate_auth.return_value = {
+            'AuthenticationResult': {
+                'AccessToken': 'test-access-token',
+                'RefreshToken': 'test-refresh-token',
+                'ExpiresIn': 3600
+            }
+        }
+
+        result = cognito_auth_instance.authenticate_user('testuser', 'password123')
+
+        assert result['success'] is True
+        assert result['username'] == 'testuser'
+        assert 'tokens' in result
+        assert result['tokens']['AccessToken'] == 'test-access-token'
+
+        # Verify correct parameters were passed
+        mock_client.admin_initiate_auth.assert_called_once()
+        call_args = mock_client.admin_initiate_auth.call_args[1]
+        assert call_args['AuthFlow'] == 'ADMIN_NO_SRP_AUTH'
+        assert call_args['AuthParameters']['USERNAME'] == 'testuser'
+        assert call_args['AuthParameters']['PASSWORD'] == 'password123'
+
+    @patch('boto3.client')
+    def test_authenticate_user_invalid_credentials(self, mock_boto_client, cognito_auth_instance):
+        """Test authentication with invalid credentials"""
+        mock_client = Mock()
+        mock_boto_client.return_value = mock_client
+        cognito_auth_instance.client = mock_client
+
+        # Mock ClientError for invalid credentials
+        error_response = {
+            'Error': {
+                'Code': 'NotAuthorizedException',
+                'Message': 'Incorrect username or password.'
+            }
+        }
+        mock_client.admin_initiate_auth.side_effect = ClientError(error_response, 'AdminInitiateAuth')
+
+        result = cognito_auth_instance.authenticate_user('testuser', 'wrongpassword')
+
+        assert result['success'] is False
+        assert result['error'] == 'Invalid username or password'
+
+    @patch('boto3.client')
+    def test_authenticate_user_unconfirmed(self, mock_boto_client, cognito_auth_instance):
+        """Test authentication with unconfirmed user"""
+        mock_client = Mock()
+        mock_boto_client.return_value = mock_client
+        cognito_auth_instance.client = mock_client
+
+        error_response = {
+            'Error': {
+                'Code': 'UserNotConfirmedException',
+                'Message': 'User is not confirmed.'
+            }
+        }
+        mock_client.admin_initiate_auth.side_effect = ClientError(error_response, 'AdminInitiateAuth')
+
+        result = cognito_auth_instance.authenticate_user('testuser', 'password123')
+
+        assert result['success'] is False
+        assert result['error'] == 'User account not confirmed'
+
+    @patch('boto3.client')
+    def test_sign_up_user_success(self, mock_boto_client, cognito_auth_instance):
+        """Test successful user registration"""
+        mock_client = Mock()
+        mock_boto_client.return_value = mock_client
+        cognito_auth_instance.client = mock_client
+
+        mock_client.sign_up.return_value = {
+            'UserSub': 'test-user-sub-id',
+            'UserConfirmed': False
+        }
+
+        result = cognito_auth_instance.sign_up_user(
+            username='newuser',
+            password='Password123!',
+            email='test@example.com',
+            first_name='Test',
+            last_name='User'
+        )
+
+        assert result['success'] is True
+        assert result['user_sub'] == 'test-user-sub-id'
+        assert result['confirmation_required'] is True
+
+        # Verify correct parameters were passed
+        mock_client.sign_up.assert_called_once()
+        call_args = mock_client.sign_up.call_args[1]
+        assert call_args['Username'] == 'newuser'
+        assert call_args['Password'] == 'Password123!'
+        assert any(attr['Name'] == 'email' and attr['Value'] == 'test@example.com'
+                  for attr in call_args['UserAttributes'])
+        assert any(attr['Name'] == 'given_name' and attr['Value'] == 'Test'
+                  for attr in call_args['UserAttributes'])
+
+    @patch('boto3.client')
+    def test_sign_up_user_duplicate_username(self, mock_boto_client, cognito_auth_instance):
+        """Test registration with existing username"""
+        mock_client = Mock()
+        mock_boto_client.return_value = mock_client
+        cognito_auth_instance.client = mock_client
+
+        error_response = {
+            'Error': {
+                'Code': 'UsernameExistsException',
+                'Message': 'An account with the given username already exists.'
+            }
+        }
+        mock_client.sign_up.side_effect = ClientError(error_response, 'SignUp')
+
+        result = cognito_auth_instance.sign_up_user('existinguser', 'Password123!', 'test@example.com')
+
+        assert result['success'] is False
+        assert result['error'] == 'Username already exists'
+
+    @patch('boto3.client')
+    def test_confirm_sign_up_success(self, mock_boto_client, cognito_auth_instance):
+        """Test successful account confirmation"""
+        mock_client = Mock()
+        mock_boto_client.return_value = mock_client
+        cognito_auth_instance.client = mock_client
+
+        mock_client.confirm_sign_up.return_value = {}
+
+        result = cognito_auth_instance.confirm_sign_up('testuser', '123456')
+
+        assert result['success'] is True
+
+        # Verify correct parameters
+        mock_client.confirm_sign_up.assert_called_once()
+        call_args = mock_client.confirm_sign_up.call_args[1]
+        assert call_args['Username'] == 'testuser'
+        assert call_args['ConfirmationCode'] == '123456'
+
+    @patch('boto3.client')
+    def test_confirm_sign_up_invalid_code(self, mock_boto_client, cognito_auth_instance):
+        """Test confirmation with invalid code"""
+        mock_client = Mock()
+        mock_boto_client.return_value = mock_client
+        cognito_auth_instance.client = mock_client
+
+        error_response = {
+            'Error': {
+                'Code': 'CodeMismatchException',
+                'Message': 'Invalid verification code provided.'
+            }
+        }
+        mock_client.confirm_sign_up.side_effect = ClientError(error_response, 'ConfirmSignUp')
+
+        result = cognito_auth_instance.confirm_sign_up('testuser', '000000')
+
+        assert result['success'] is False
+        assert result['error'] == 'Invalid verification code'
+
+    @patch('boto3.client')
+    def test_get_user_info_success(self, mock_boto_client, cognito_auth_instance):
+        """Test successful user info retrieval"""
+        mock_client = Mock()
+        mock_boto_client.return_value = mock_client
+        cognito_auth_instance.client = mock_client
+
+        mock_client.get_user.return_value = {
+            'Username': 'testuser',
+            'UserAttributes': [
+                {'Name': 'email', 'Value': 'test@example.com'},
+                {'Name': 'given_name', 'Value': 'Test'},
+                {'Name': 'family_name', 'Value': 'User'}
+            ]
+        }
+
+        result = cognito_auth_instance.get_user_info('test-access-token')
+
+        assert result['success'] is True
+        assert result['username'] == 'testuser'
+        assert result['attributes']['email'] == 'test@example.com'
+        assert result['attributes']['given_name'] == 'Test'
+        assert result['attributes']['family_name'] == 'User'
+
+    @patch('boto3.client')
+    def test_resend_confirmation_code_success(self, mock_boto_client, cognito_auth_instance):
+        """Test successful confirmation code resend"""
+        mock_client = Mock()
+        mock_boto_client.return_value = mock_client
+        cognito_auth_instance.client = mock_client
+
+        mock_client.resend_confirmation_code.return_value = {}
+
+        result = cognito_auth_instance.resend_confirmation_code('testuser')
+
+        assert result['success'] is True
+        mock_client.resend_confirmation_code.assert_called_once()
+
+
+class TestFlaskRoutes:
+    """Integration tests for Flask routes"""
+
+    @pytest.fixture
+    def client(self):
+        """Create test client"""
+        app.config['TESTING'] = True
+        app.config['WTF_CSRF_ENABLED'] = False
+        return app.test_client()
+
+    @pytest.fixture
+    def app_context(self):
+        """Create application context"""
+        with app.app_context():
+            yield app
+
+    def test_index_redirect_to_login(self, client):
+        """Test index page redirects to login when not authenticated"""
+        response = client.get('/')
+        assert response.status_code == 302
+        assert '/login' in response.location
+
+    def test_login_page_get(self, client):
+        """Test login page loads correctly"""
+        response = client.get('/login')
+        assert response.status_code == 200
+        assert b'AWS Cognito Login' in response.data
+        assert b'Username:' in response.data
+        assert b'Password:' in response.data
+        assert b'Sign up here' in response.data
+
+    @patch('app.cognito_auth')
+    def test_login_post_success(self, mock_cognito_auth, client):
+        """Test successful login"""
+        # Mock successful authentication
+        mock_cognito_auth.authenticate_user.return_value = {
+            'success': True,
+            'tokens': {
+                'AccessToken': 'test-access-token',
+                'RefreshToken': 'test-refresh-token',
+                'ExpiresIn': 3600
+            },
+            'username': 'testuser'
+        }
+
+        mock_cognito_auth.get_user_info.return_value = {
+            'success': True,
+            'username': 'testuser',
+            'attributes': {'email': 'test@example.com'}
+        }
+
+        response = client.post('/login', data={
+            'username': 'testuser',
+            'password': 'password123'
+        })
+
+        assert response.status_code == 302
+        assert '/dashboard' in response.location
+
+        # Verify methods were called
+        mock_cognito_auth.authenticate_user.assert_called_once_with('testuser', 'password123')
+        mock_cognito_auth.get_user_info.assert_called_once()
+
+    @patch('app.cognito_auth')
+    def test_login_post_invalid_credentials(self, mock_cognito_auth, client):
+        """Test login with invalid credentials"""
+        mock_cognito_auth.authenticate_user.return_value = {
+            'success': False,
+            'error': 'Invalid username or password'
+        }
+
+        response = client.post('/login', data={
+            'username': 'testuser',
+            'password': 'wrongpassword'
+        })
+
+        assert response.status_code == 200
+        assert b'Invalid username or password' in response.data
+
+    def test_login_post_missing_fields(self, client):
+        """Test login with missing fields"""
+        response = client.post('/login', data={
+            'username': '',
+            'password': 'password123'
+        })
+
+        assert response.status_code == 200
+        assert b'Please enter both username and password' in response.data
+
+    def test_register_page_get(self, client):
+        """Test registration page loads correctly"""
+        response = client.get('/register')
+        assert response.status_code == 200
+        assert b'Create Account' in response.data
+        assert b'Password Requirements:' in response.data
+        assert b'Email:' in response.data
+        assert b'Username:' in response.data
+
+    @patch('app.cognito_auth')
+    def test_register_post_success(self, mock_cognito_auth, client):
+        """Test successful registration"""
+        mock_cognito_auth.sign_up_user.return_value = {
+            'success': True,
+            'user_sub': 'test-user-sub',
+            'confirmation_required': True
+        }
+
+        response = client.post('/register', data={
+            'username': 'newuser',
+            'email': 'new@example.com',
+            'password': 'Password123!',
+            'confirm_password': 'Password123!',
+            'first_name': 'New',
+            'last_name': 'User'
+        })
+
+        assert response.status_code == 302
+        assert '/confirm/newuser' in response.location
+
+        # Verify sign_up_user was called with correct parameters
+        mock_cognito_auth.sign_up_user.assert_called_once_with(
+            username='newuser',
+            password='Password123!',
+            email='new@example.com',
+            first_name='New',
+            last_name='User'
+        )
+
+    def test_register_post_password_mismatch(self, client):
+        """Test registration with password mismatch"""
+        response = client.post('/register', data={
+            'username': 'newuser',
+            'email': 'new@example.com',
+            'password': 'Password123!',
+            'confirm_password': 'DifferentPassword!',
+            'first_name': 'New',
+            'last_name': 'User'
+        })
+
+        assert response.status_code == 200
+        assert b'Passwords do not match' in response.data
+
+    def test_register_post_weak_password(self, client):
+        """Test registration with weak password"""
+        response = client.post('/register', data={
+            'username': 'newuser',
+            'email': 'new@example.com',
+            'password': '123',
+            'confirm_password': '123'
+        })
+
+        assert response.status_code == 200
+        assert b'Password must be at least 8 characters long' in response.data
+
+    def test_register_post_missing_required_fields(self, client):
+        """Test registration with missing required fields"""
+        response = client.post('/register', data={
+            'username': '',
+            'email': 'new@example.com',
+            'password': 'Password123!',
+            'confirm_password': 'Password123!'
+        })
+
+        assert response.status_code == 200
+        assert b'Please fill in all required fields' in response.data
+
+    @patch('app.cognito_auth')
+    def test_confirm_account_success(self, mock_cognito_auth, client):
+        """Test successful account confirmation"""
+        mock_cognito_auth.confirm_sign_up.return_value = {'success': True}
+
+        response = client.post('/confirm/testuser', data={
+            'username': 'testuser',
+            'confirmation_code': '123456'
+        })
+
+        assert response.status_code == 302
+        assert '/login' in response.location
+
+        mock_cognito_auth.confirm_sign_up.assert_called_once_with('testuser', '123456')
+
+    @patch('app.cognito_auth')
+    def test_confirm_account_invalid_code(self, mock_cognito_auth, client):
+        """Test account confirmation with invalid code"""
+        mock_cognito_auth.confirm_sign_up.return_value = {
+            'success': False,
+            'error': 'Invalid verification code'
+        }
+
+        response = client.post('/confirm/testuser', data={
+            'username': 'testuser',
+            'confirmation_code': '000000'
+        })
+
+        assert response.status_code == 200
+        assert b'Invalid verification code' in response.data
+
+    def test_confirm_account_missing_code(self, client):
+        """Test confirmation with missing code"""
+        response = client.post('/confirm/testuser', data={
+            'username': 'testuser',
+            'confirmation_code': '   '  # whitespace only
+        })
+
+        assert response.status_code == 200
+        assert b'Please enter the verification code' in response.data
+
+    @patch('app.cognito_auth')
+    def test_resend_confirmation_success(self, mock_cognito_auth, client):
+        """Test successful confirmation code resend"""
+        mock_cognito_auth.resend_confirmation_code.return_value = {'success': True}
+
+        response = client.post('/resend-confirmation', data={
+            'username': 'testuser'
+        })
+
+        assert response.status_code == 302
+        assert '/confirm/testuser' in response.location
+
+        mock_cognito_auth.resend_confirmation_code.assert_called_once_with('testuser')
+
+    def test_protected_route_without_login(self, client):
+        """Test accessing protected route without login"""
+        response = client.get('/dashboard')
+        assert response.status_code == 302
+        assert '/login' in response.location
+
+    def test_dashboard_requires_authentication(self, client):
+        """Test dashboard requires authentication"""
+        response = client.get('/dashboard')
+        assert response.status_code == 302
+
+        # Follow redirect to login page
+        response = client.get('/dashboard', follow_redirects=True)
+        assert b'Please log in to access this page' in response.data
+
+    def test_profile_requires_authentication(self, client):
+        """Test profile endpoint requires authentication"""
+        response = client.get('/profile')
+        assert response.status_code == 302
+        assert '/login' in response.location
+
+    def test_protected_api_requires_authentication(self, client):
+        """Test protected API requires authentication"""
+        response = client.get('/api/protected')
+        assert response.status_code == 302
+        assert '/login' in response.location
+
+    def test_logout(self, client):
+        """Test logout functionality"""
+        # First, simulate being logged in by setting session
+        with client.session_transaction() as sess:
+            sess['user'] = {
+                'username': 'testuser',
+                'attributes': {'email': 'test@example.com'}
+            }
+            sess['access_token'] = 'test-token'
+
+        response = client.get('/logout')
+        assert response.status_code == 302
+        assert '/login' in response.location
+
+        # Verify session is cleared
+        with client.session_transaction() as sess:
+            assert 'user' not in sess
+            assert 'access_token' not in sess
+
+
+class TestAuthenticationFlow:
+    """End-to-end authentication flow tests"""
+
+    @pytest.fixture
+    def client(self):
+        """Create test client"""
+        app.config['TESTING'] = True
+        app.config['WTF_CSRF_ENABLED'] = False
+        return app.test_client()
+
+    @patch('app.cognito_auth')
+    def test_complete_registration_flow(self, mock_cognito_auth, client):
+        """Test complete user registration and confirmation flow"""
+        # Step 1: Register user
+        mock_cognito_auth.sign_up_user.return_value = {
+            'success': True,
+            'user_sub': 'test-user-sub',
+            'confirmation_required': True
+        }
+
+        response = client.post('/register', data={
+            'username': 'flowuser',
+            'email': 'flow@example.com',
+            'password': 'Password123!',
+            'confirm_password': 'Password123!',
+            'first_name': 'Flow',
+            'last_name': 'User'
+        })
+
+        assert response.status_code == 302
+        assert '/confirm/flowuser' in response.location
+
+        # Step 2: Confirm account
+        mock_cognito_auth.confirm_sign_up.return_value = {'success': True}
+
+        response = client.post('/confirm/flowuser', data={
+            'username': 'flowuser',
+            'confirmation_code': '123456'
+        })
+
+        assert response.status_code == 302
+        assert '/login' in response.location
+
+        # Step 3: Login
+        mock_cognito_auth.authenticate_user.return_value = {
+            'success': True,
+            'tokens': {
+                'AccessToken': 'test-access-token',
+                'RefreshToken': 'test-refresh-token',
+                'ExpiresIn': 3600
+            },
+            'username': 'flowuser'
+        }
+
+        mock_cognito_auth.get_user_info.return_value = {
+            'success': True,
+            'username': 'flowuser',
+            'attributes': {'email': 'flow@example.com', 'given_name': 'Flow'}
+        }
+
+        response = client.post('/login', data={
+            'username': 'flowuser',
+            'password': 'Password123!'
+        })
+
+        assert response.status_code == 302
+        assert '/dashboard' in response.location
+
+        # Verify all methods were called in correct order
+        assert mock_cognito_auth.sign_up_user.called
+        assert mock_cognito_auth.confirm_sign_up.called
+        assert mock_cognito_auth.authenticate_user.called
+        assert mock_cognito_auth.get_user_info.called
+
+
+class TestErrorHandling:
+    """Test error handling scenarios"""
+
+    @pytest.fixture
+    def client(self):
+        """Create test client"""
+        app.config['TESTING'] = True
+        app.config['WTF_CSRF_ENABLED'] = False
+        return app.test_client()
+
+    @patch('app.cognito_auth')
+    def test_authentication_network_error(self, mock_cognito_auth, client):
+        """Test handling of network errors during authentication"""
+        mock_cognito_auth.authenticate_user.return_value = {
+            'success': False,
+            'error': 'Authentication failed: Network error'
+        }
+
+        response = client.post('/login', data={
+            'username': 'testuser',
+            'password': 'password123'
+        })
+
+        assert response.status_code == 200
+        assert b'Authentication failed: Network error' in response.data
+
+    @patch('app.cognito_auth')
+    def test_registration_aws_service_error(self, mock_cognito_auth, client):
+        """Test handling of AWS service errors during registration"""
+        mock_cognito_auth.sign_up_user.return_value = {
+            'success': False,
+            'error': 'Password does not meet requirements'
+        }
+
+        response = client.post('/register', data={
+            'username': 'newuser',
+            'email': 'new@example.com',
+            'password': 'weakpass',
+            'confirm_password': 'weakpass'
+        })
+
+        assert response.status_code == 200
+        assert b'Password does not meet requirements' in response.data
+
+    @patch('app.cognito_auth')
+    def test_confirmation_expired_code_error(self, mock_cognito_auth, client):
+        """Test handling of expired confirmation codes"""
+        mock_cognito_auth.confirm_sign_up.return_value = {
+            'success': False,
+            'error': 'Verification code has expired'
+        }
+
+        response = client.post('/confirm/testuser', data={
+            'username': 'testuser',
+            'confirmation_code': '123456'
+        })
+
+        assert response.status_code == 200
+        assert b'Verification code has expired' in response.data
+
+
+class TestSessionManagement:
+    """Test session management functionality"""
+
+    @pytest.fixture
+    def client(self):
+        """Create test client"""
+        app.config['TESTING'] = True
+        app.config['WTF_CSRF_ENABLED'] = False
+        return app.test_client()
+
+    def test_session_cleared_on_logout(self, client):
+        """Test that session is properly cleared on logout"""
+        # Set up authenticated session
+        with client.session_transaction() as sess:
+            sess['user'] = {
+                'username': 'testuser',
+                'attributes': {'email': 'test@example.com'}
+            }
+            sess['access_token'] = 'test-token'
+            sess['refresh_token'] = 'test-refresh-token'
+            sess['login_time'] = datetime.now().isoformat()
+
+        # Logout
+        response = client.get('/logout')
+        assert response.status_code == 302
+
+        # Verify all session data is cleared
+        with client.session_transaction() as sess:
+            assert 'user' not in sess
+            assert 'access_token' not in sess
+            assert 'refresh_token' not in sess
+            assert 'login_time' not in sess
+
+    def test_redirect_when_already_logged_in(self, client):
+        """Test redirect behavior when user is already logged in"""
+        # Set up authenticated session
+        with client.session_transaction() as sess:
+            sess['user'] = {
+                'username': 'testuser',
+                'attributes': {'email': 'test@example.com'}
+            }
+
+        # Try to access login page
+        response = client.get('/login')
+        assert response.status_code == 302
+        assert '/dashboard' in response.location
+
+        # Try to access register page
+        response = client.get('/register')
+        assert response.status_code == 302
+        assert '/dashboard' in response.location
+
+
+if __name__ == '__main__':
+    # Run tests if script is executed directly
+    pytest.main([__file__, '-v', '--tb=short'])
+```
+
+---
+
+## conftest.py
+```python
+#!/usr/bin/env python3
+"""
+Test configuration and shared fixtures for AWS Cognito Flask Application
+
+This file contains pytest configuration and reusable fixtures for all tests.
+Place this file in the same directory as your test files.
+"""
+
+import pytest
+import os
+from datetime import datetime, timedelta
+from unittest.mock import Mock
+
+# Set test environment variables
+os.environ.update({
+    'TESTING': 'True',
+    'SECRET_KEY': 'test-secret-key-for-testing',
+    'COGNITO_USER_POOL_ID': 'us-east-1_test123456',
+    'COGNITO_CLIENT_ID': 'test-client-id',
+    'COGNITO_CLIENT_SECRET': 'test-client-secret',
+    'COGNITO_REGION': 'us-east-1',
+    'WTF_CSRF_ENABLED': 'False'
+})
+
+
+@pytest.fixture
+def sample_user_data():
+    """Sample user data for testing"""
+    return {
+        'username': 'testuser',
+        'email': 'test@example.com',
+        'password': 'Password123!',
+        'first_name': 'Test',
+        'last_name': 'User'
+    }
+
+
+@pytest.fixture
+def sample_tokens():
+    """Sample JWT tokens for testing"""
+    return {
+        'AccessToken': 'eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.test.access.token',
+        'RefreshToken': 'eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.test.refresh.token',
+        'IdToken': 'eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.test.id.token',
+        'ExpiresIn': 3600,
+        'TokenType': 'Bearer'
+    }
+
+
+@pytest.fixture
+def sample_user_attributes():
+    """Sample user attributes from Cognito"""
+    return {
+        'email': 'test@example.com',
+        'given_name': 'Test',
+        'family_name': 'User',
+        'email_verified': 'true'
+    }
+
+
+@pytest.fixture
+def authenticated_session():
+    """Sample authenticated session data"""
+    return {
+        'user': {
+            'username': 'testuser',
+            'attributes': {
+                'email': 'test@example.com',
+                'given_name': 'Test',
+                'family_name': 'User'
+            }
+        },
+        'access_token': 'test-access-token',
+        'refresh_token': 'test-refresh-token',
+        'login_time': datetime.now().isoformat(),
+        'token_expires': (datetime.now() + timedelta(hours=1)).isoformat()
+    }
+
+
+@pytest.fixture
+def mock_successful_auth_response():
+    """Mock successful authentication response"""
+    return {
+        'success': True,
+        'tokens': {
+            'AccessToken': 'test-access-token',
+            'RefreshToken': 'test-refresh-token',
+            'ExpiresIn': 3600
+        },
+        'username': 'testuser'
+    }
+
+
+@pytest.fixture
+def mock_successful_user_info_response():
+    """Mock successful get_user_info response"""
+    return {
+        'success': True,
+        'username': 'testuser',
+        'attributes': {
+            'email': 'test@example.com',
+            'given_name': 'Test',
+            'family_name': 'User'
+        }
+    }
+
+
+@pytest.fixture
+def mock_successful_signup_response():
+    """Mock successful sign-up response"""
+    return {
+        'success': True,
+        'user_sub': 'test-user-sub-12345',
+        'confirmation_required': True
+    }
+
+
+@pytest.fixture
+def mock_cognito_error_responses():
+    """Common Cognito error responses for testing"""
+    return {
+        'invalid_credentials': {
+            'success': False,
+            'error': 'Invalid username or password'
+        },
+        'user_not_confirmed': {
+            'success': False,
+            'error': 'User account not confirmed'
+        },
+        'username_exists': {
+            'success': False,
+            'error': 'Username already exists'
+        },
+        'invalid_password': {
+            'success': False,
+            'error': 'Password does not meet requirements'
+        },
+        'invalid_code': {
+            'success': False,
+            'error': 'Invalid verification code'
+        },
+        'expired_code': {
+            'success': False,
+            'error': 'Verification code has expired'
+        }
+    }
+
+
+@pytest.fixture
+def registration_form_data():
+    """Valid registration form data"""
+    return {
+        'username': 'newuser',
+        'email': 'new@example.com',
+        'password': 'Password123!',
+        'confirm_password': 'Password123!',
+        'first_name': 'New',
+        'last_name': 'User'
+    }
+
+
+@pytest.fixture
+def login_form_data():
+    """Valid login form data"""
+    return {
+        'username': 'testuser',
+        'password': 'Password123!'
+    }
+
+
+@pytest.fixture
+def confirmation_form_data():
+    """Valid confirmation form data"""
+    return {
+        'username': 'testuser',
+        'confirmation_code': '123456'
+    }
+
+
+# Pytest configuration
+def pytest_configure(config):
+    """Configure pytest with custom markers"""
+    config.addinivalue_line(
+        "markers", "unit: marks tests as unit tests"
+    )
+    config.addinivalue_line(
+        "markers", "integration: marks tests as integration tests"
+    )
+    config.addinivalue_line(
+        "markers", "auth: marks tests related to authentication"
+    )
+    config.addinivalue_line(
+        "markers", "routes: marks tests related to Flask routes"
+    )
+    config.addinivalue_line(
+        "markers", "slow: marks tests as slow (deselect with '-m \"not slow\"')"
+    )
+
+
+# Custom test utilities
+class TestHelpers:
+    """Helper methods for testing"""
+
+    @staticmethod
+    def assert_redirect_to_login(response):
+        """Assert that response redirects to login page"""
+        assert response.status_code == 302
+        assert '/login' in response.location
+
+    @staticmethod
+    def assert_redirect_to_dashboard(response):
+        """Assert that response redirects to dashboard"""
+        assert response.status_code == 302
+        assert '/dashboard' in response.location
+
+    @staticmethod
+    def assert_flash_message_contains(response, message_text):
+        """Assert that response contains flash message"""
+        assert message_text.encode() in response.data
+
+    @staticmethod
+    def create_authenticated_session(client, user_data=None):
+        """Helper to create authenticated session for testing"""
+        if user_data is None:
+            user_data = {
+                'username': 'testuser',
+                'attributes': {'email': 'test@example.com'}
+            }
+
+        with client.session_transaction() as sess:
+            sess['user'] = user_data
+            sess['access_token'] = 'test-access-token'
+            sess['refresh_token'] = 'test-refresh-token'
+            sess['login_time'] = datetime.now().isoformat()
+            sess['token_expires'] = (datetime.now() + timedelta(hours=1))
+
+
+@pytest.fixture
+def test_helpers():
+    """Provide test helper methods"""
+    return TestHelpers
+```
+
+---
+
+## requirements.txt
+```
+flask>=2.3.0
+boto3>=1.28.0
+botocore>=1.31.0
+python-jose[cryptography]>=3.3.0
+```
+
+---
+
+## requirements-test.txt
+```
+# Core testing framework
+pytest>=7.4.0
+pytest-mock>=3.11.0
+pytest-flask>=1.2.0
+pytest-cov>=4.1.0
+pytest-xdist>=3.3.0
+
+# AWS mocking
+moto[cognitoidp]>=4.2.0
+boto3>=1.28.0
+botocore>=1.31.0
+
+# HTTP testing
+responses>=0.23.0
+requests-mock>=1.11.0
+
+# Time mocking
+freezegun>=1.2.0
+
+# Code quality
+flake8>=6.0.0
+black>=23.0.0
+isort>=5.12.0
+
+# Additional utilities
+factory-boy>=3.3.0
+faker>=19.0.0
+```
+
+---
+
+## pytest.ini
+```ini
+[tool:pytest]
+testpaths = .
+python_files = test_*.py
+python_classes = Test*
+python_functions = test_*
+addopts =
+    -v
+    --tb=short
+    --strict-markers
+    --strict-config
+    --color=yes
+    --durations=10
+    --disable-warnings
+markers =
+    unit: Unit tests
+    integration: Integration tests
+    auth: Authentication related tests
+    routes: Flask route tests
+    slow: Slow running tests
+    network: Tests that require network access
+    aws: Tests that interact with AWS services
+filterwarnings =
+    ignore::DeprecationWarning
+    ignore::PendingDeprecationWarning
+```
+
+---
+
+## .coveragerc
+```ini
+[run]
+source = .
+omit =
+    */tests/*
+    */test_*
+    */venv/*
+    */env/*
+    */.env/*
+    */site-packages/*
+    conftest.py
+    setup.py
+
+[report]
+exclude_lines =
+    pragma: no cover
+    def __repr__
+    raise AssertionError
+    raise NotImplementedError
+    if __name__ == .__main__.:
+    if TYPE_CHECKING:
+
+[html]
+directory = htmlcov
+```
+
+---
+
+## Makefile
+```makefile
+.PHONY: test test-unit test-integration test-auth test-coverage test-fast clean install-test
+
+# Install test dependencies
+install-test:
+	pip install -r requirements-test.txt
+
+# Run all tests
+test:
+	pytest
+
+# Run only unit tests
+test-unit:
+	pytest -m "unit" -v
+
+# Run only integration tests
+test-integration:
+	pytest -m "integration" -v
+
+# Run authentication related tests
+test-auth:
+	pytest -m "auth" -v
+
+# Run route related tests
+test-routes:
+	pytest -m "routes" -v
+
+# Run tests with coverage report
+test-coverage:
+	pytest --cov=app --cov-report=html --cov-report=term-missing
+
+# Run tests in parallel (faster)
+test-parallel:
+	pytest -n auto
+
+# Run tests excluding slow ones
+test-fast:
+	pytest -m "not slow" -v
+
+# Run specific test file
+test-file:
+	pytest test_app.py -v
+
+# Run specific test class
+test-class:
+	pytest test_app.py::TestCognitoAuth -v
+
+# Run specific test method
+test-method:
+	pytest test_app.py::TestCognitoAuth::test_authenticate_user_success -v
+
+# Generate coverage report
+coverage:
+	pytest --cov=app --cov-report=html
+	@echo "Coverage report generated in htmlcov/index.html"
+
+# Clean test artifacts
+clean:
+	rm -rf .pytest_cache/
+	rm -rf htmlcov/
+	rm -rf .coverage
+	find . -type d -name __pycache__ -exec rm -rf {} +
+	find . -type f -name "*.pyc" -delete
+
+# Run linting
+lint:
+	flake8 app.py test_app.py
+	black --check app.py test_app.py
+	isort --check-only app.py test_app.py
+
+# Fix code formatting
+format:
+	black app.py test_app.py
+	isort app.py test_app.py
+
+# Run all checks (tests + linting)
+check: test lint
+
+# Debug failing tests
+debug:
+	pytest --pdb -v
+
+# Show test collection without running
+collect:
+	pytest --collect-only
+
+# Run tests with verbose output
+verbose:
+	pytest -vv -s
+```
+
+---
+
+## .gitignore
+```
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# celery beat schedule file
+celerybeat-schedule
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Project specific
+*.log
+.env.local
+.env.development
+.env.test
+.env.production
+```
+
+---
+
+## setup.py
+```python
+from setuptools import setup, find_packages
+
+with open("README.md", "r", encoding="utf-8") as fh:
+    long_description = fh.read()
+
+with open("requirements.txt", "r", encoding="utf-8") as fh:
+    requirements = [line.strip() for line in fh if line.strip() and not line.startswith("#")]
+
+setup(
+    name="aws-cognito-flask-app",
+    version="1.0.0",
+    author="Your Name",
+    author_email="your.email@example.com",
+    description="A complete Flask application with AWS Cognito authentication",
+    long_description=long_description,
+    long_description_content_type="text/markdown",
+    url="https://github.com/yourusername/aws-cognito-flask-app",
+    packages=find_packages(),
+    classifiers=[
+        "Development Status :: 4 - Beta",
+        "Intended Audience :: Developers",
+        "License :: OSI Approved :: MIT License",
+        "Operating System :: OS Independent",
+        "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.8",
+        "Programming Language :: Python :: 3.9",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Framework :: Flask",
+    ],
+    python_requires=">=3.8",
+    install_requires=requirements,
+    extras_require={
+        "test": [
+            "pytest>=7.4.0",
+            "pytest-mock>=3.11.0",
+            "pytest-flask>=1.2.0",
+            "pytest-cov>=4.1.0",
+            "moto[cognitoidp]>=4.2.0",
+        ],
+        "dev": [
+            "black>=23.0.0",
+            "flake8>=6.0.0",
+            "isort>=5.12.0",
+        ],
+    },
+    entry_points={
+        "console_scripts": [
+            "aws-cognito-flask-app=app:main",
+        ],
+    },
+)
+```
+
+---
+
+## Quick Setup Instructions
+
+1. **Create a directory and save all files:**
+   ```bash
+   mkdir aws-cognito-flask-app
+   cd aws-cognito-flask-app
+   ```
+
+2. **Copy each file above into separate files** with the exact names shown
+
+3. **Install dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   pip install -r requirements-test.txt
+   ```
+
+4. **Set environment variables:**
+   ```bash
+   export COGNITO_USER_POOL_ID='us-east-1_xxxxxxxxx'
+   export COGNITO_CLIENT_ID='your-client-id'
+   export COGNITO_CLIENT_SECRET='your-client-secret'
+   export SECRET_KEY='your-secret-key-here'
+   ```
+
+5. **Run the app:**
+   ```bash
+   python app.py
+   ```
+
+6. **Run tests:**
+   ```bash
+   pytest
+   make test-coverage
+   ```
+
+7. **Create your own zip file:**
+   ```bash
+   zip -r aws-cognito-flask-app.zip . -x "*.pyc" "*__pycache__*" "*.git*"
+   ```
+
+This gives you a complete, production-ready Flask application with AWS Cognito authentication, comprehensive testing, and all the development tools you need! 🎉
