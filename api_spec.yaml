@@ -1,0 +1,374 @@
+openapi: 3.0.3
+info:
+  title: Card Game API
+  description: API for managing card game operations including decks, hands, and players
+  version: 1.0.0
+  contact:
+    name: Card Game API Support
+    email: support@cardgame.com
+
+servers:
+  - url: https://api.cardgame.com/v1
+    description: Production server
+  - url: https://staging-api.cardgame.com/v1
+    description: Staging server
+
+paths:
+  /decks/{deckId}/draw:
+    post:
+      summary: Draw cards from a deck
+      description: Draws a specified number of cards from the deck. Returns empty array if no cards available.
+      operationId: drawCards
+      parameters:
+        - name: deckId
+          in: path
+          required: true
+          description: The unique identifier of the deck
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                numberOfCards:
+                  type: integer
+                  minimum: 1
+                  maximum: 52
+                  description: Number of cards to draw
+              required:
+                - numberOfCards
+      responses:
+        '200':
+          description: Cards successfully drawn
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  cards:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Card'
+                  remainingCards:
+                    type: integer
+                    description: Number of cards remaining in deck
+        '404':
+          description: Deck not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /hands/discard:
+    post:
+      summary: Discard cards from a hand
+      description: Discards a specified number of cards from the player's hand back to the deck
+      operationId: discardCards
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                numberOfCards:
+                  type: integer
+                  minimum: 1
+                  description: Number of cards to discard
+                hand:
+                  $ref: '#/components/schemas/Hand'
+              required:
+                - numberOfCards
+                - hand
+      responses:
+        '200':
+          description: Cards successfully discarded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  updatedHand:
+                    $ref: '#/components/schemas/Hand'
+        '400':
+          description: Invalid request or insufficient cards in hand
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /players/{playerId}/decks:
+    post:
+      summary: Add deck to player
+      description: Adds a new deck to the player's collection of decks
+      operationId: addDeckToPlayer
+      parameters:
+        - name: playerId
+          in: path
+          required: true
+          description: The unique identifier of the player
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Deck'
+      responses:
+        '201':
+          description: Deck successfully added to player
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Player'
+        '404':
+          description: Player not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '400':
+          description: Invalid deck data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /decks/{deckId}/shuffle:
+    post:
+      summary: Shuffle a deck
+      description: Randomly shuffles all cards in the specified deck
+      operationId: shuffleDeck
+      parameters:
+        - name: deckId
+          in: path
+          required: true
+          description: The unique identifier of the deck to shuffle
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Deck successfully shuffled
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  deck:
+                    $ref: '#/components/schemas/Deck'
+        '404':
+          description: Deck not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+components:
+  schemas:
+    Card:
+      type: object
+      description: Represents a single playing card
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Unique identifier for the card
+        cardType:
+          type: string
+          enum: [standard, joker, special, wild, action]
+          description: The type/category of the card
+        suit:
+          type: string
+          enum: [hearts, diamonds, clubs, spades, none]
+          description: The suit of the card (none for special cards)
+        rank:
+          type: string
+          enum: [A, "2", "3", "4", "5", "6", "7", "8", "9", "10", J, Q, K, joker, wild]
+          description: The rank/face value of the card
+        value:
+          type: integer
+          minimum: 0
+          maximum: 15
+          description: Numeric value of the card for game calculations
+        imageUrl:
+          type: string
+          format: uri
+          description: URL to the card's image
+        specialEffect:
+          type: string
+          description: Description of special effect for non-standard cards
+      required:
+        - id
+        - cardType
+        - suit
+        - rank
+        - value
+
+    Deck:
+      type: object
+      description: Represents a deck of cards
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Unique identifier for the deck
+        name:
+          type: string
+          description: Name or description of the deck
+        cards:
+          type: array
+          items:
+            $ref: '#/components/schemas/Card'
+          description: Array of cards in the deck
+        totalCards:
+          type: integer
+          description: Total number of cards in the deck
+        isShuffled:
+          type: boolean
+          description: Whether the deck has been shuffled
+        createdAt:
+          type: string
+          format: date-time
+          description: When the deck was created
+      required:
+        - id
+        - name
+        - cards
+        - totalCards
+
+    Hand:
+      type: object
+      description: Represents a player's hand of cards
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Unique identifier for the hand
+        deckId:
+          type: string
+          format: uuid
+          description: Reference to the deck this hand draws from
+        cards:
+          type: array
+          items:
+            $ref: '#/components/schemas/Card'
+          description: Array of cards currently in the hand
+        maxSize:
+          type: integer
+          minimum: 1
+          description: Maximum number of cards allowed in hand
+        playerId:
+          type: string
+          format: uuid
+          description: Reference to the player who owns this hand
+      required:
+        - id
+        - deckId
+        - cards
+        - playerId
+
+    Player:
+      type: object
+      description: Represents a game player
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Unique identifier for the player
+        name:
+          type: string
+          minLength: 1
+          maxLength: 50
+          description: Player's display name
+        email:
+          type: string
+          format: email
+          description: Player's email address
+        decks:
+          type: array
+          items:
+            $ref: '#/components/schemas/Deck'
+          description: Array of decks owned by the player
+        hands:
+          type: array
+          items:
+            $ref: '#/components/schemas/Hand'
+          description: Array of hands belonging to the player
+        score:
+          type: integer
+          minimum: 0
+          description: Player's current game score
+        isActive:
+          type: boolean
+          description: Whether the player is currently active in a game
+        createdAt:
+          type: string
+          format: date-time
+          description: When the player account was created
+      required:
+        - id
+        - name
+        - decks
+        - hands
+
+    Error:
+      type: object
+      description: Standard error response
+      properties:
+        code:
+          type: string
+          description: Error code identifier
+        message:
+          type: string
+          description: Human-readable error message
+        details:
+          type: string
+          description: Additional error details
+        timestamp:
+          type: string
+          format: date-time
+          description: When the error occurred
+      required:
+        - code
+        - message
+        - timestamp
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Cards
+    description: Operations related to drawing and managing cards
+  - name: Decks
+    description: Operations for deck management and shuffling
+  - name: Players
+    description: Player management operations
+  - name: Hands
+    description: Hand management and card discard operations
